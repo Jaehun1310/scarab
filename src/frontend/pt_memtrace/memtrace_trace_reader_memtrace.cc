@@ -335,17 +335,29 @@ uint8_t sidecar_reg_to_scarab_reg(uint16_t sidecar_reg) {
 }  // namespace
 
 void TraceReaderMemtrace::initRegValueSidecars(const std::string& trace) {
-  // The trace argument may be the trace directory or a file inside it; the
-  // sidecars live in <dir>/raw/reg_values/ (or directly in <dir>/raw).
+  // The trace argument may be the trace directory or a file inside it.  The
+  // sidecars live in a raw/reg_values/ directory that is either a sibling of
+  // the trace ("<dir>/raw"), or -- in the scarab-infra per-simpoint layout,
+  // where "<simp>.zip" pairs with "<simp>/raw/" -- under a directory named
+  // after the trace file itself.
   std::string base = trace;
+  std::string stem_raw;
   if (!directory_iterator_t::is_directory(base)) {
     const size_t slash = base.find_last_of('/');
     if (slash == std::string::npos)
       return;
+    std::string fname = base.substr(slash + 1);
     base = base.substr(0, slash);
+    const size_t dot = fname.find_last_of('.');
+    if (dot != std::string::npos && dot > 0)
+      stem_raw = base + "/" + fname.substr(0, dot) + "/raw";
   }
-  std::string raw_dir = base + "/raw";
-  if (!directory_iterator_t::is_directory(raw_dir))
+  std::string raw_dir;
+  if (!stem_raw.empty() && directory_iterator_t::is_directory(stem_raw))
+    raw_dir = stem_raw;
+  else if (directory_iterator_t::is_directory(base + "/raw"))
+    raw_dir = base + "/raw";
+  else
     raw_dir = base;
   std::string sidecar_dir = raw_dir + "/reg_values";
   if (!directory_iterator_t::is_directory(sidecar_dir))
