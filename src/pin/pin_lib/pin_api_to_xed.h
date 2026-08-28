@@ -39,6 +39,8 @@ extern "C" {
 #include "xed-interface.h"
 }
 
+#include "ctype_pin_inst.h"
+
 enum class CustomOp : uint8_t { NONE, PREFETCH_CODE };
 
 struct InstInfo {
@@ -57,6 +59,10 @@ struct InstInfo {
   bool mem_used[2] = {};                // mem address usage flags
   bool mem_is_rd[2] = {};               // mem is load
   bool mem_is_wr[2] = {};               // mem is store
+  // Destination register values from a reg-value sidecar, indexed by the ctype
+  // dst_regs slot they belong to (identity-matched by the reader).
+  uint64_t reg_value[MAX_DESTS] = {};
+  bool reg_value_valid[MAX_DESTS] = {};
   CustomOp custom_op = CustomOp::NONE;  // Special or non-x86 ISA instruction
   bool taken = false;                   // branch taken
   bool unknown_type = false;            // No available decode info (presents a nop)

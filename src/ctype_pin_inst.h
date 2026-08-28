@@ -139,6 +139,12 @@ typedef struct ctype_pin_inst_struct {
   uint64_t ld_data[MAX_LD_NUM];  // loaded value (scalar <=8B, captured at IPOINT_BEFORE; 0 for wider)
   uint8_t ld_size;
   uint8_t st_size;
+  /* Value-presence masks: bit j set means dests[j].val / ld_data[j] holds a real
+   * captured value.  Value sources that capture everything (PIN exec) set all
+   * bits; partial sources (memtrace reg-value sidecars) set only what they
+   * know, so a 0 value is never mistaken for a captured 0. */
+  uint8_t dst_value_valid_mask;
+  uint8_t ld_data_valid_mask;
 
   uint64_t branch_target;  // not the dynamic info. static info  // 8 bytes
   uint8_t actually_taken : 1;

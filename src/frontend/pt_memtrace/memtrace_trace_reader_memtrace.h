@@ -28,6 +28,9 @@
 #ifndef MEMTRACE_READER_MEMTRACE_H
 #define MEMTRACE_READER_MEMTRACE_H
 
+#include <cstdio>
+#include <unordered_map>
+
 #include "globals/assert.h"
 
 #include "frontend/pt_memtrace/memtrace_trace_reader.h"
@@ -42,7 +45,7 @@
 class TraceReaderMemtrace : public TraceReader {
  public:
   const InstInfo* getNextInstruction() override;
-  TraceReaderMemtrace(const std::string& _trace, uint32_t _bufsize);
+  TraceReaderMemtrace(const std::string& _trace, uint32_t _bufsize, bool _enable_reg_value_sidecar = false);
   ~TraceReaderMemtrace();
 
  private:
@@ -58,12 +61,43 @@ class TraceReaderMemtrace : public TraceReader {
   uint32_t add_dependency_info(ctype_pin_inst* info, instr_t* drinst);
   void fill_in_basic_info(ctype_pin_inst* info, instr_t* drinst, size_t size, dynamorio::drmemtrace::trace_type_t type);
   bool typeIsMem(dynamorio::drmemtrace::trace_type_t _type);
+  void initRegValueSidecars(const std::string& trace);
+  void closeRegValueSidecars();
+  void maybeAttachRegValues(InstInfo* info);
+
+  /// v2 reg-value sidecar file layout (written packed by the tracer; natural
+  /// alignment pads identically, guarded by a static_assert at the read site).
+  struct RegValueSidecarFileHeader {
+    uint64_t magic;
+    uint64_t version;
+    uint64_t tid;
+  };
+  struct RegValueSidecarRecord {
+    uint64_t inst_seq;  // writer-side ordinal; diagnostics only, never used for matching
+    uint64_t pc;
+    uint64_t value[MAX_DESTS];
+    uint16_t reg[MAX_DESTS];  // normalized DR reg id per slot (0xFFFF = rflags)
+    uint8_t num_dsts;
+    uint8_t valid_mask;
+    uint16_t reserved0;
+    uint32_t reserved1;
+  };
+  struct RegValueSidecarStream {
+    FILE* file = nullptr;
+    bool eof = false;
+    uint64_t tid = 0;
+    /// Records dropped because their pc was never asked about (instructions the
+    /// tracer records but scarab decodes without dst slots, e.g. `ret`).
+    uint64_t skipped_records = 0;
+  };
 
   std::unique_ptr<dynamorio::drmemtrace::module_mapper_t> module_mapper_ = nullptr;
   dynamorio::drmemtrace::raw2trace_directory_t directory_ = {};
   void* dcontext_ = nullptr;
   unsigned int knob_verbose_ = 0;
   bool trace_has_encodings_ = false;
+  bool reg_value_sidecar_enabled_ = false;
+  std::unordered_map<uint64_t, RegValueSidecarStream> reg_value_sidecars_ = {};
 
   enum class MTState {
     INST,

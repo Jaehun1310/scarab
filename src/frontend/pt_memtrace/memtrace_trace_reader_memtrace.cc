@@ -283,14 +283,201 @@ uint8_t dr_isa_to_scarab_reg(reg_id_t reg) {
   return SCARAB_REG_INV;  // Invalid or out-of-bounds
 }
 
+// ---- v2 reg-value sidecar support -------------------------------------------------
+// The tracer (drmemtrace -trace_regv) writes one packed record per instruction
+// that updates a capturable register (GPR/SIMD/k-mask) or the flags, in program
+// order, into raw/reg_values/reg_values.<tid>.bin next to the trace.  Values are
+// matched to instructions by stream order + pc, and to dst slots by register
+// identity, never by position across the two decoders.
+
+namespace {
+constexpr uint64_t kRegValueSidecarMagic = 0x5343415241425247ULL;  // "SCARABRG"
+constexpr uint64_t kRegValueSidecarVersion = 2;
+constexpr uint16_t kRegValueSidecarRflags = 0xFFFF;
+constexpr const char* kRegValueSidecarPrefix = "reg_values.";
+constexpr const char* kRegValueSidecarSuffix = ".bin";
+
+// Maps the normalized DR register id carried in a sidecar record to scarab's
+// compressed register id, so values attach to ctype dst slots by identity.
+uint8_t sidecar_reg_to_scarab_reg(uint16_t sidecar_reg) {
+  if (sidecar_reg == kRegValueSidecarRflags)
+    return SCARAB_REG_ZPS;
+  const reg_id_t reg = (reg_id_t)sidecar_reg;
+  switch (reg) {
+    case DR_REG_RAX: return SCARAB_REG_RAX;
+    case DR_REG_RBX: return SCARAB_REG_RBX;
+    case DR_REG_RCX: return SCARAB_REG_RCX;
+    case DR_REG_RDX: return SCARAB_REG_RDX;
+    case DR_REG_RBP: return SCARAB_REG_RBP;
+    case DR_REG_RSI: return SCARAB_REG_RSI;
+    case DR_REG_RDI: return SCARAB_REG_RDI;
+    case DR_REG_RSP: return SCARAB_REG_RSP;
+    case DR_REG_R8: return SCARAB_REG_R8;
+    case DR_REG_R9: return SCARAB_REG_R9;
+    case DR_REG_R10: return SCARAB_REG_R10;
+    case DR_REG_R11: return SCARAB_REG_R11;
+    case DR_REG_R12: return SCARAB_REG_R12;
+    case DR_REG_R13: return SCARAB_REG_R13;
+    case DR_REG_R14: return SCARAB_REG_R14;
+    case DR_REG_R15: return SCARAB_REG_R15;
+    default: break;
+  }
+  if (reg >= DR_REG_K0 && reg <= DR_REG_K7)
+    return (uint8_t)(SCARAB_REG_K0 + (reg - DR_REG_K0));
+  if (reg >= DR_REG_XMM0 && reg <= DR_REG_XMM31)
+    return (uint8_t)(SCARAB_REG_ZMM0 + (reg - DR_REG_XMM0));
+  if (reg >= DR_REG_YMM0 && reg <= DR_REG_YMM31)
+    return (uint8_t)(SCARAB_REG_ZMM0 + (reg - DR_REG_YMM0));
+  if (reg >= DR_REG_ZMM0 && reg <= DR_REG_ZMM31)
+    return (uint8_t)(SCARAB_REG_ZMM0 + (reg - DR_REG_ZMM0));
+  return SCARAB_REG_INV;  // MMX and anything else scarab does not track
+}
+}  // namespace
+
+void TraceReaderMemtrace::initRegValueSidecars(const std::string& trace) {
+  // The trace argument may be the trace directory or a file inside it; the
+  // sidecars live in <dir>/raw/reg_values/ (or directly in <dir>/raw).
+  std::string base = trace;
+  if (!directory_iterator_t::is_directory(base)) {
+    const size_t slash = base.find_last_of('/');
+    if (slash == std::string::npos)
+      return;
+    base = base.substr(0, slash);
+  }
+  std::string raw_dir = base + "/raw";
+  if (!directory_iterator_t::is_directory(raw_dir))
+    raw_dir = base;
+  std::string sidecar_dir = raw_dir + "/reg_values";
+  if (!directory_iterator_t::is_directory(sidecar_dir))
+    sidecar_dir = raw_dir;
+
+  directory_iterator_t end;
+  directory_iterator_t iter(sidecar_dir);
+  for (; iter != end; ++iter) {
+    const std::string fname = *iter;
+    if (fname.rfind(kRegValueSidecarPrefix, 0) != 0)
+      continue;
+    if (fname.size() <= strlen(kRegValueSidecarPrefix) + strlen(kRegValueSidecarSuffix))
+      continue;
+    if (fname.substr(fname.size() - strlen(kRegValueSidecarSuffix)) != kRegValueSidecarSuffix)
+      continue;
+
+    const std::string full_path = sidecar_dir + "/" + fname;
+    FILE* file = fopen(full_path.c_str(), "rb");
+    if (!file) {
+      warn("Failed to open reg-value sidecar: %s\n", full_path.c_str());
+      continue;
+    }
+    RegValueSidecarFileHeader header = {};
+    if (fread(&header, sizeof(header), 1, file) != 1 || header.magic != kRegValueSidecarMagic ||
+        header.version != kRegValueSidecarVersion) {
+      warn("Ignoring incompatible reg-value sidecar (need v%lu): %s\n", kRegValueSidecarVersion, full_path.c_str());
+      fclose(file);
+      continue;
+    }
+    RegValueSidecarStream stream = {};
+    stream.file = file;
+    stream.tid = header.tid;
+    reg_value_sidecars_[stream.tid] = stream;
+  }
+
+  if (reg_value_sidecars_.empty()) {
+    warn("TRACE_REGV enabled, but no reg-value sidecars were found under %s\n", sidecar_dir.c_str());
+  }
+}
+
+void TraceReaderMemtrace::closeRegValueSidecars() {
+  for (auto& entry : reg_value_sidecars_) {
+    auto& stream = entry.second;
+    if (stream.skipped_records > 0) {
+      printf("Reg-value sidecar tid=%lu: skipped %lu records for pcs without scarab dst slots\n", stream.tid,
+             stream.skipped_records);
+    }
+    if (stream.file) {
+      fclose(stream.file);
+      stream.file = nullptr;
+    }
+  }
+  reg_value_sidecars_.clear();
+}
+
+void TraceReaderMemtrace::maybeAttachRegValues(InstInfo* info) {
+  // The tracer writes packed structs; if natural alignment ever pads this side
+  // differently, fread would misparse every record.
+  static_assert(sizeof(RegValueSidecarRecord) == 104, "must match the tracer's packed v2 record");
+  if (!reg_value_sidecar_enabled_ || !info || !info->valid || !info->info)
+    return;
+  if (info->fake_inst || info->is_dr_ins)
+    return;  // synthesized instructions / REGDEPS decode: no sidecar contract (yet)
+  const ctype_pin_inst* ctype = info->info;
+  if (ctype->num_dst_regs == 0)
+    return;
+  // Symmetric with the tracer: string ops never get sidecar records (their rep
+  // expansion produces per-iteration records the collapsed trace view cannot
+  // line up with), so don't look for one.
+  if (ctype->is_string || ctype->is_repeat)
+    return;
+
+  auto stream_it = reg_value_sidecars_.find(info->tid);
+  if (stream_it == reg_value_sidecars_.end() || !stream_it->second.file || stream_it->second.eof)
+    return;
+
+  // The tracer records a superset of the instructions scarab decodes with dst
+  // slots (e.g. `ret` updates rsp for the tracer but has no scarab dst), so the
+  // stream legitimately contains records for pcs we never ask about: skip them
+  // until our pc comes up.  A long run without a match means the streams have
+  // genuinely diverged, so give up instead of scanning forever.
+  RegValueSidecarRecord rec = {};
+  uint32_t skipped = 0;
+  while (true) {
+    if (fread(&rec, sizeof(rec), 1, stream_it->second.file) != 1) {
+      stream_it->second.eof = true;
+      return;
+    }
+    if (rec.pc == info->pc)
+      break;
+    stream_it->second.skipped_records++;
+    if (++skipped > 64) {
+      warn("Reg-value sidecar desync for tid=%lu: no record for trace pc=0x%lx within %u records (last sidecar "
+           "pc=0x%lx seq=%lu)\n",
+           info->tid, info->pc, skipped, rec.pc, rec.inst_seq);
+      stream_it->second.eof = true;
+      return;
+    }
+  }
+
+  // Match record slots to ctype dst slots by register identity: a value only
+  // attaches to a slot whose dst_regs entry names the same register, so any
+  // ordering/membership difference between the two decoders degrades to a
+  // dropped value, never a misattribution.
+  const uint8_t num_recorded = rec.num_dsts <= MAX_DESTS ? rec.num_dsts : MAX_DESTS;
+  const uint8_t num_slots = ctype->num_dst_regs <= MAX_DESTS ? ctype->num_dst_regs : MAX_DESTS;
+  for (uint8_t k = 0; k < num_recorded; k++) {
+    if (!(rec.valid_mask & (1u << k)))
+      continue;
+    const uint8_t scarab_reg = sidecar_reg_to_scarab_reg(rec.reg[k]);
+    if (scarab_reg == SCARAB_REG_INV)
+      continue;
+    for (uint8_t j = 0; j < num_slots; j++) {
+      if (ctype->dst_regs[j] == scarab_reg && !info->reg_value_valid[j]) {
+        info->reg_value[j] = rec.value[k];
+        info->reg_value_valid[j] = true;
+        break;
+      }
+    }
+  }
+}
+// ---- end v2 reg-value sidecar support ---------------------------------------------
+
 // Trace Reader
-TraceReaderMemtrace::TraceReaderMemtrace(const std::string& _trace, uint32_t _bufsize)
+TraceReaderMemtrace::TraceReaderMemtrace(const std::string& _trace, uint32_t _bufsize, bool _enable_reg_value_sidecar)
     : TraceReader(_trace, _bufsize),
       module_mapper_(nullptr),
       directory_(),
       dcontext_(nullptr),
       knob_verbose_(0),
       trace_has_encodings_(false),
+      reg_value_sidecar_enabled_(_enable_reg_value_sidecar),
       reader_at_eof_(false),
       reader_first_read_(true),
       roi_end_(0),
@@ -305,6 +492,7 @@ TraceReaderMemtrace::TraceReaderMemtrace(const std::string& _trace, uint32_t _bu
 }
 
 TraceReaderMemtrace::~TraceReaderMemtrace() {
+  closeRegValueSidecars();
   if (mt_warn_target_ > 0) {
     warn("Set %lu conditional branches to 'not-taken' due to pid/tid gaps\n", mt_warn_target_);
   }
@@ -318,6 +506,9 @@ void TraceReaderMemtrace::init(const std::string& _trace) {
   mt_info_b_.custom_op = CustomOp::NONE;
   mt_info_a_.valid = true;
   mt_info_b_.valid = true;
+  if (reg_value_sidecar_enabled_) {
+    initRegValueSidecars(_trace);
+  }
   TraceReader::init(_trace);
 }
 
@@ -433,6 +624,10 @@ std::unordered_map<uint64_t, std::tuple<int, bool, bool, bool, ctype_pin_inst>> 
 bool TraceReaderMemtrace::getNextInstruction__(InstInfo* _info, InstInfo* _prior) {
   uint32_t prior_isize = mt_prior_isize_;
   bool complete = false;
+
+  // _info alternates between two reused buffers; stale sidecar values from two
+  // instructions ago must never leak into this one.
+  memset(_info->reg_value_valid, 0, sizeof(_info->reg_value_valid));
 
   DrInstProbe probe(dcontext_);
 
@@ -557,6 +752,9 @@ bool TraceReaderMemtrace::getNextInstruction__(InstInfo* _info, InstInfo* _prior
   }
 PATCH_REP:
   _info->valid &= complete;
+  if (complete) {
+    maybeAttachRegValues(_info);
+  }
   // Compute the branch target information for the prior instruction
   if (_info->valid) {
     auto ctype_prior_iter = ctype_inst_map.find(_prior->pc);

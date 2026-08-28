@@ -289,6 +289,7 @@ void create_compressed_op(ADDRINT iaddr) {
     for(uint ld = 0; ld < num_lds; ld++) {
       filled_inst_info->ld_vaddr[ld] = glb_ld_vaddrs[ld];
       filled_inst_info->ld_data[ld] = glb_ld_data[ld];
+      filled_inst_info->ld_data_valid_mask |= (uint8_t)(1u << ld);
     }
 
     uint num_sts = glb_st_vaddrs.size();
@@ -429,6 +430,7 @@ void fill_register_values(ctype_pin_inst* inst, bool is_dst, const deque<Pin_Reg
       inst->dests[i].id = global_vals[i].id;
       inst->dests[i].val = global_vals[i].val;
       inst->dests[i].size = global_vals[i].size;
+      inst->dst_value_valid_mask |= (uint8_t)(1u << i);
       continue;
     }
 

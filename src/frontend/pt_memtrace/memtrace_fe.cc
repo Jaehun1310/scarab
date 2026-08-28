@@ -35,6 +35,7 @@ extern "C" {
 
 #include "debug/debug.param.h"
 #include "debug/debug_macros.h"
+#include "general.param.h"
 }
 
 #include "bp/bp.param.h"
@@ -144,6 +145,21 @@ void fill_in_dynamic_info(ctype_pin_inst* info, const InstInfo* insi) {
     } else if (insi->mem_is_wr[op]) {
       info->st_vaddr[st++] = insi->mem_addr[op];
     }
+  }
+
+  // Destination register values from the reg-value sidecar (already
+  // identity-matched to dst_regs slots by the reader).  Memtrace has no
+  // load-data capture, so ld_data_valid_mask stays 0 and convert_dyn_uop falls
+  // back to the architectural dst value for pure loads.
+  info->dst_value_valid_mask = 0;
+  info->ld_data_valid_mask = 0;
+  for (uint8_t j = 0; j < info->num_dst_regs && j < MAX_DESTS; j++) {
+    if (!insi->reg_value_valid[j])
+      continue;
+    info->dests[j].id = info->dst_regs[j];
+    info->dests[j].val = insi->reg_value[j];
+    info->dests[j].size = 8;
+    info->dst_value_valid_mask |= (uint8_t)(1u << j);
   }
 }
 
@@ -266,7 +282,7 @@ void memtrace_setup(uns proc_id) {
   std::string path(trace_files[proc_id]);
   std::string trace(path);
 
-  trace_readers[proc_id] = new TraceReaderMemtrace(trace, 1);
+  trace_readers[proc_id] = new TraceReaderMemtrace(trace, 1, TRACE_REGV);
 
   if (FAST_FORWARD) {
     ASSERT(proc_id, !MEMTRACE_ROI_BEGIN && !MEMTRACE_ROI_END);
