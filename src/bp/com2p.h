@@ -51,7 +51,8 @@ typedef enum Com2p_Cls_enum {
   COM2P_NUM_CLS,
 } Com2p_Cls;
 
-#define COM2P_REJ_INCONSISTENT COM2P_NUM_CLS  // reject_reason: structure varied across instances
+#define COM2P_REJ_INCONSISTENT COM2P_NUM_CLS         // reject_reason: structure varied during profiling
+#define COM2P_REJ_GATE_UNSTABLE (COM2P_NUM_CLS + 1)  // reject_reason: confirmed structure stopped holding at runtime
 
 typedef enum Com2p_State_enum {
   COM2P_ST_PROFILING,

@@ -210,4 +210,6 @@ DEF_PARAM(  com2p_obs_n               , COM2P_OBS_N               , uns     , un
 DEF_PARAM(  com2p_consist_pct         , COM2P_CONSIST_PCT         , uns     , uns        , 95         ,        )
 DEF_PARAM(  com2p_table_buckets       , COM2P_TABLE_BUCKETS       , uns     , uns        , 4096       ,        )
 
-DEF_PARAM( tagescl64kb_perfect_tag    , TAGESCL64KB_PERFECT_TAG   , Flag    , Flag       , FALSE      ,        )
+DEF_PARAM( tagescl64kb_perfect_tag    , TAGESCL64KB_PERFECT_TAG   , Flag    , Flag       , FALSE      ,        )/* runtime eviction: gate attempts before judging, and the structure-hold floor (hysteresis below consist_pct) */
+DEF_PARAM(  com2p_gate_n              , COM2P_GATE_N              , uns     , uns        , 64         ,        )
+DEF_PARAM(  com2p_gate_min_pct        , COM2P_GATE_MIN_PCT        , uns     , uns        , 75         ,        )

@@ -389,6 +389,17 @@ void com2p_on_map(Op* op) {
     e->gate_match++;
   else
     e->gate_mismatch++;
+
+  /* Runtime continuation of the profiling consistency check: once enough gate
+   * attempts accumulate, an entry whose structure stops holding is evicted
+   * (tombstoned, so it cannot thrash back in).  The confirm bar (CONSIST_PCT)
+   * sits above this eviction bar on purpose -- hysteresis. */
+  Counter attempts = e->gate_match + e->gate_mismatch;
+  if (attempts >= COM2P_GATE_N && e->gate_match * 100 < attempts * (Counter)COM2P_GATE_MIN_PCT) {
+    e->state = COM2P_ST_REJECTED;
+    e->reject_reason = COM2P_REJ_GATE_UNSTABLE;
+    STAT_EVENT(op->proc_id, COM2P_ENTRY_EVICTED);
+  }
 }
 
 /**************************************************************************************/
@@ -404,7 +415,7 @@ void com2p_reset(void) {
 typedef struct Com2p_Dump_Agg_struct {
   Counter entries;
   Counter by_state[3];
-  Counter rejected_by_reason[COM2P_NUM_CLS + 1];
+  Counter rejected_by_reason[COM2P_NUM_CLS + 2];
   Counter confirmed_by_cls[COM2P_NUM_CLS];
   Counter gate_match, gate_mismatch, unresolved;
 } Com2p_Dump_Agg;
@@ -444,7 +455,7 @@ void com2p_dump(void) {
   printf("COM2P GATE match=%llu mismatch=%llu\n", (unsigned long long)agg.gate_match,
          (unsigned long long)agg.gate_mismatch);
   printf("COM2P REJECTED_BY_REASON");
-  for (uns r = 0; r <= COM2P_NUM_CLS; r++)
+  for (uns r = 0; r <= COM2P_NUM_CLS + 1; r++)
     printf(" %u:%llu", r, (unsigned long long)agg.rejected_by_reason[r]);
   printf("\n");
 }
