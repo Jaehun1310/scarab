@@ -645,7 +645,13 @@ void com2p_on_map(Op* op) {
   if (op->uop->cf_type != CF_CBR)
     return;
   Com2p_Entry* e = com2p_lookup(op->inst->addr);
-  if (!e || e->state == COM2P_ST_REJECTED)
+  if (!e)
+    return;
+  /* Normally a REJECTED tombstone ends observation.  In profile_all mode we
+   * keep classifying every instance -- otherwise CONFIRMED (dir) entries
+   * accumulate stats forever while rejected classes freeze at OBS_N per PC,
+   * skewing the instance-weighted distribution to ~100% dir. */
+  if (e->state == COM2P_ST_REJECTED && !COM2P_PROFILE_ALL)
     return;
 
   Com2p_Obs obs;
@@ -657,6 +663,9 @@ void com2p_on_map(Op* op) {
   STAT_EVENT(op->proc_id, COM2P_OBS_UNRESOLVED + cls);
   if (op->bp_pred_main.recovery_point == RECOVER_AT_EXEC)
     STAT_EVENT(op->proc_id, COM2P_OBSMIS_UNRESOLVED + cls);
+
+  if (e->state == COM2P_ST_REJECTED)
+    return;  // profile_all: distribution only, the tombstone stays final
 
   if (e->state == COM2P_ST_PROFILING) {
     if (cls == COM2P_CLS_UNRESOLVED) {
