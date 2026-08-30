@@ -48,6 +48,12 @@ typedef enum Com2p_Cls_enum {
   COM2P_CLS_MULTI_COND,  // branch sources resolve to more than one producer
   COM2P_CLS_NO_COND,     // no producer for the branch condition at all
   COM2P_CLS_COMPLEX,     // more than two compare sides
+  /* chain-walk refinements of the old CONST_COMP (comp mass now splits here) */
+  COM2P_CLS_CONST_CHAIN,     // one load behind an immediate-only op chain (3D-coverable)
+  COM2P_CLS_LVL_CHAIN,       // two loads, at least one side behind an immediate-only chain (novel)
+  COM2P_CLS_COMP_MULTIREG,   // a chain node consumed a second dynamic register (ARF-reset rule)
+  COM2P_CLS_COMP_COMPLEX_OP, // mul/div in the chain (disqualified even with immediates)
+  COM2P_CLS_COMP_TOO_DEEP,   // chain longer than COM2P_CHAIN_MAX_OPS
   COM2P_NUM_CLS,
 } Com2p_Cls;
 
@@ -69,6 +75,7 @@ typedef struct Com2p_Entry_struct {
   uns8 cmp_folded;
   uns8 num_loads;
   uns8 cond_class;  // Cbr_Cond_Class
+  uns8 chain_len[2];  // ops between load_pc[i] and the cond (0 = raw); contents live in the chain table
   Addr load_pc[2];
   uns64 imm;  // reserved for COM2P_REALISTIC_COMPUTE (immediate operand of the compare)
   /* profiling */

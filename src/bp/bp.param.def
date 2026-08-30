@@ -214,3 +214,4 @@ DEF_PARAM( tagescl64kb_perfect_tag    , TAGESCL64KB_PERFECT_TAG   , Flag    , Fl
 DEF_PARAM(  com2p_profile_all         , COM2P_PROFILE_ALL         , Flag    , Flag       , FALSE      ,        )
 DEF_PARAM(  com2p_gate_n              , COM2P_GATE_N              , uns     , uns        , 64         ,        )
 DEF_PARAM(  com2p_gate_min_pct        , COM2P_GATE_MIN_PCT        , uns     , uns        , 75         ,        )
+DEF_PARAM(  com2p_chain_max_ops       , COM2P_CHAIN_MAX_OPS       , uns     , uns        , 4          ,        )
