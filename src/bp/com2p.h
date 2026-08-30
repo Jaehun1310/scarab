@@ -24,8 +24,8 @@
  * Description  : COM2P -- overrides H2P conditional-branch predictions by computing
  *                the direction from the feeder load value(s).  This header exposes
  *                the metadata table that learns, per H2P branch PC, which loads
- *                feed the condition and how (direct vs computed), via a shallow
- *                dependency walk at map time.
+ *                feed the condition and how (direct vs computed), via ARF-ext
+ *                forward propagation at retire (3D-Branch Overrider style).
  ***************************************************************************************/
 #ifndef __COM2P_H__
 #define __COM2P_H__
@@ -90,10 +90,9 @@ typedef struct Com2p_Entry_struct {
   Counter success;
 } Com2p_Entry;
 
-void com2p_on_retire(struct Op_struct* op);  // H2P detection -> table allocation
-void com2p_note_retire(struct Op_struct* op); // every retired op: refresh the retired-reg snapshots
-void com2p_on_map(struct Op_struct* op);     // shallow walk -> profiling / gate
-void com2p_reset(void);                      // warmup boundary: drop all state
-void com2p_dump(void);                       // end-of-sim summary
+void com2p_on_retire(struct Op_struct* op);   // H2P alloc + classification (profiling / gate)
+void com2p_note_retire(struct Op_struct* op);  // every retired op: ARF-ext forward propagation
+void com2p_reset(void);                        // warmup boundary: drop all state
+void com2p_dump(void);                         // end-of-sim summary
 
 #endif /* #ifndef __COM2P_H__ */

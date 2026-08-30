@@ -22,22 +22,17 @@
 /***************************************************************************************
  * File         : bp/com2p.c
  * Description  : COM2P metadata table.  Allocation happens at retire when a CBR
- *                with a targetable condition class crosses the H2P threshold;
- *                profiling happens at map time with a deliberately shallow
- *                (two-hop) dependency walk:
- *
- *                  branch --(flags/reg src)--> cond uop --(reg srcs)--> producers
- *
- *                An instance is a dir target exactly when the cond's value
- *                operands are produced by loads themselves (or the cond IS the
- *                load, for a compare folded into a load-op).  comp chains are
- *                labelled with a reason and NOT traversed -- that is 3D-Overrider
- *                scope, gated behind COM2P_COVER_COMP later.
- *
- *                Producers are resolved from in-flight state only (validated
- *                src_info).  H2P branches have varying feeder values, so their
- *                producers are near the branch and practically always in flight;
- *                COM2P_OBS_UNRESOLVED measures the residue of that assumption.
+ *                with a targetable condition class crosses the H2P threshold.
+ *                Structure learning is retire-time ARF-ext forward propagation
+ *                (3D-Branch Overrider, PACT'20 Fig. 6): every retired op copies
+ *                its source register's {load PC, immediate-only op chain} record
+ *                to its destination registers, appending itself; the last flag
+ *                writer additionally snapshots its register-source records (two
+ *                slots -- the LVL extension over the paper).  A retiring branch
+ *                classifies from that snapshot: the whole chain arrives within
+ *                one dynamic pass, WAR/WAW register reuse cannot corrupt it
+ *                (retire order == program order, records travel by value), and
+ *                there are no producer pointers left to go stale.
  ***************************************************************************************/
 
 #include "bp/com2p.h"
@@ -59,6 +54,9 @@
 
 #include "xed-interface.h"
 
+/* Hard bound for chain records everywhere; COM2P_CHAIN_MAX_OPS must stay within. */
+#define COM2P_CHAIN_MAX_HARD 8
+
 /**************************************************************************************/
 /* Table */
 
@@ -72,38 +70,9 @@ static void com2p_table_init(void) {
   ASSERTM(0, !COM2P_OVERRIDE, "com2p_override is not implemented yet\n");
   ASSERTM(0, !COM2P_REALISTIC_SUPPLY, "com2p_realistic_supply is not implemented yet\n");
   ASSERTM(0, !COM2P_REALISTIC_COMPUTE, "com2p_realistic_compute is not implemented yet\n");
+  ASSERTM(0, COM2P_CHAIN_MAX_OPS <= COM2P_CHAIN_MAX_HARD, "com2p_chain_max_ops > %u\n", COM2P_CHAIN_MAX_HARD);
   init_hash_table(&com2p_table, "com2p", COM2P_TABLE_BUCKETS, sizeof(Com2p_Entry));
   com2p_table_inited = TRUE;
-}
-
-/* Last retired writer per architectural register.  Recoveries stall re-fetched
- * consumers long enough for their (older, flush-surviving) producers to retire;
- * this map keeps just enough of them to finish the walk, validated exactly via
- * the (op_num, unique_num) recorded in the consumer's src_info. */
-typedef struct Com2p_Retired_Reg_struct {
-  Counter op_num;
-  Counter unique_num;
-  Addr pc;
-  Flag is_load;
-  Flag valid;
-} Com2p_Retired_Reg;
-
-static Com2p_Retired_Reg com2p_retired_reg[NUM_REGS];
-
-void com2p_note_retire(Op* op) {
-  if (!COM2P_ENABLE)
-    return;
-  for (uns i = 0; i < op->uop->num_dest_regs; i++) {
-    uns16 id = op->uop->dests[i].id;
-    if (id >= NUM_REGS)
-      continue;
-    Com2p_Retired_Reg* r = &com2p_retired_reg[id];
-    r->op_num = op->op_num;
-    r->unique_num = op->unique_num;
-    r->pc = op->inst->addr;
-    r->is_load = op->uop->mem_type == MEM_LD;
-    r->valid = TRUE;
-  }
 }
 
 /* ---- immediate re-decode cache -------------------------------------------------
@@ -181,7 +150,7 @@ typedef struct Com2p_Chain_struct {
   Addr load_pc;
   uns8 slot;
   uns8 len;
-  Com2p_Chain_Step step[4];  // load-side first
+  Com2p_Chain_Step step[COM2P_CHAIN_MAX_HARD];  // load-side first
   Flag valid;
 } Com2p_Chain;
 
@@ -233,7 +202,7 @@ static Com2p_Entry* com2p_lookup(Addr pc) {
 }
 
 /**************************************************************************************/
-/* Shallow walk */
+/* ARF-ext learning */
 
 typedef struct Com2p_Obs_struct {
   uns8 cls;
@@ -241,278 +210,239 @@ typedef struct Com2p_Obs_struct {
   uns8 num_loads;
   Addr load_pc[2];
   uns8 chain_len[2];
-  Com2p_Chain_Step chain[2][4];
+  Com2p_Chain_Step chain[2][COM2P_CHAIN_MAX_HARD];
 } Com2p_Obs;
 
-/* Resolves a map dependency to its in-flight producer.  Returns NULL with
- * *stale set when the producer existed but has left the op pool (retired or
- * flushed); returns NULL with *stale clear for the init_map() no-producer
- * sentinel (op_num == 0). */
-static Op* com2p_resolve(Src_Info* src, Flag* stale) {
-  Op* p = src->op;
-  if (src->op_num == 0)
-    return NULL;
-  if (p && p->op_pool_valid && p->op_num == src->op_num && p->unique_num == src->unique_num && p->inst)
-    return p;
-  *stale = TRUE;
-  return NULL;
+typedef enum Com2p_Arf_Kind_enum {
+  COM2P_ARF_UNKNOWN,  // register not written since reset: never an observation
+  COM2P_ARF_CONST,    // rooted in immediate materialization, no load involved
+  COM2P_ARF_LOAD,     // a load value behind >= 0 immediate-only ops (compliant)
+  COM2P_ARF_TAINT,    // disqualified; taint carries the Com2p_Cls reason
+} Com2p_Arf_Kind;
+
+typedef struct Com2p_Arf_Rec_struct {
+  uns8 kind;   // Com2p_Arf_Kind
+  uns8 taint;  // COM2P_CLS_COMP_* when kind == COM2P_ARF_TAINT
+  uns8 len;    // ops applied since the load (0 = raw) when kind == COM2P_ARF_LOAD
+  Addr load_pc;
+  Com2p_Chain_Step step[COM2P_CHAIN_MAX_HARD];  // load-side first
+} Com2p_Arf_Rec;
+
+/* Snapshot of the last flag-writer's register-source records, taken as it
+ * retires.  This is what a flags-consuming branch classifies from; two slots
+ * because LVL compares two register values. */
+typedef struct Com2p_Flags_Rec_struct {
+  Flag valid;
+  uns8 num_slots;    // distinct register sources captured (<= 2)
+  uns8 overflow;     // more than two distinct register sources (COMPLEX)
+  uns8 self_pair;    // some register consumed twice (test r,r)
+  uns8 flag_src;     // the writer consumed flags itself (adc/sbb chains)
+  uns8 folded_load;  // the writer was itself a MEM_LD uop (cmp [mem],imm)
+  Addr writer_pc;
+  Com2p_Arf_Rec slot[2];
+} Com2p_Flags_Rec;
+
+static Com2p_Arf_Rec com2p_arf[NUM_REGS];
+static Com2p_Flags_Rec com2p_flags;
+
+static inline Flag com2p_op_class_compliant(Op_Type ot) {
+  return ot == OP_MOV || ot == OP_IADD || ot == OP_LOGIC || ot == OP_SHIFT || ot == OP_LDA;
 }
 
-static inline Flag com2p_op_is_load(Op* op) {
-  return op->uop->mem_type == MEM_LD;
-}
-
-/* Slot producer view: enough for the dir judgment whether the producer is
- * still in flight or already retired (via the retired-reg snapshot). */
-typedef struct Com2p_Prod_struct {
-  Flag resolved;
-  Flag is_load;
-  Addr pc;
-  Counter op_num;  // for SELF dedup
-  Op* op;          // non-NULL only while in flight (chain walking needs src_info)
-} Com2p_Prod;
-
-static Flag com2p_resolve_slot(Src_Info* src, uns16 reg_id, Com2p_Prod* out) {
-  memset(out, 0, sizeof(*out));
-  Flag stale = FALSE;
-  Op* p = com2p_resolve(src, &stale);
-  if (p) {
-    out->resolved = TRUE;
-    out->is_load = com2p_op_is_load(p);
-    out->pc = p->inst->addr;
-    out->op_num = p->op_num;
-    out->op = p;
-    return TRUE;
+void com2p_note_retire(Op* op) {
+  if (!COM2P_ENABLE)
+    return;
+  const Static_Op_Info* uop = op->uop;
+  uns num_dsts = uop->num_dest_regs;
+  Flag writes_flags = FALSE;
+  Flag writes_reg = FALSE;
+  for (uns i = 0; i < num_dsts; i++) {
+    if (uop->dests[i].id == REG_ZPS)
+      writes_flags = TRUE;
+    else if (uop->dests[i].id < NUM_REGS)
+      writes_reg = TRUE;
   }
-  if (!stale)
-    return TRUE;  // no-producer sentinel: resolved as "no producer" (out->resolved stays FALSE)
-  if (reg_id < NUM_REGS) {
-    Com2p_Retired_Reg* r = &com2p_retired_reg[reg_id];
-    if (r->valid && r->op_num == src->op_num && r->unique_num == src->unique_num) {
-      out->resolved = TRUE;
-      out->is_load = r->is_load;
-      out->pc = r->pc;
-      out->op_num = r->op_num;
-      return TRUE;
-    }
-  }
-  return FALSE;  // genuinely unresolved
-}
+  if (!writes_flags && !writes_reg)
+    return;
 
-/* Walks an immediate-only op chain backward from a non-load producer until a
- * load (success), a disqualifier (multi-register input, mul/div, depth), or a
- * stale node.  Steps are recorded cond-side-first and reversed to load-first
- * order on success.  Mirrors the 3D paper's ARF-reset semantics. */
-typedef enum Com2p_Chain_Res_enum {
-  COM2P_CHAIN_OK,
-  COM2P_CHAIN_MULTIREG,
-  COM2P_CHAIN_COMPLEX_OP,
-  COM2P_CHAIN_TOO_DEEP,
-  COM2P_CHAIN_TO_CONST,  // chain ends at a no-producer register (no load involved)
-  COM2P_CHAIN_STALE,
-} Com2p_Chain_Res;
-
-static Com2p_Chain_Res com2p_chain_walk(Op* start, Addr* load_pc, uns8* len, Com2p_Chain_Step* steps) {
-  Op* node = start;
-  uns depth = 0;
-  *len = 0;
-  while (TRUE) {
-    if (depth >= COM2P_CHAIN_MAX_OPS)
-      return COM2P_CHAIN_TOO_DEEP;
-    Op_Type ot = node->uop->op_type;
-    if (ot == OP_IMUL || ot == OP_IDIV)
-      return COM2P_CHAIN_COMPLEX_OP;
-    if (ot != OP_MOV && ot != OP_IADD && ot != OP_LOGIC && ot != OP_SHIFT && ot != OP_LDA)
-      return COM2P_CHAIN_MULTIREG;  // unsupported op class == non-compliant input
-    /* the node must consume exactly one dynamic register value (+immediates) */
-    Com2p_Prod next;
-    Flag have_next = FALSE;
-    uns nsrc = node->uop->num_src_regs;
-    if (nsrc > node->num_srcs)
-      return COM2P_CHAIN_STALE;  // src_info not fully materialized; treat as unresolved
-    for (uns j = 0; j < nsrc; j++) {
-      if (node->uop->srcs[j].id == REG_ZPS)
-        return COM2P_CHAIN_MULTIREG;  // flags input (adc-style): extra dynamic input
-      Com2p_Prod prod;
-      if (!com2p_resolve_slot(&node->src_info[j], node->uop->srcs[j].id, &prod))
-        return COM2P_CHAIN_STALE;
-      if (!prod.resolved)
-        continue;  // never-written register: constant-ish input
-      if (have_next && prod.op_num != next.op_num)
-        return COM2P_CHAIN_MULTIREG;
-      next = prod;
-      have_next = TRUE;
+  /* Read phase: snapshot the distinct register sources before any dst update
+   * (a dst may alias a src; in-place chains rely on read-then-write order). */
+  uns16 src_id[8];
+  Com2p_Arf_Rec src_rec[8];
+  uns num_src = 0;
+  Flag self_pair = FALSE;
+  Flag reads_flags = FALSE;
+  for (uns j = 0; j < uop->num_src_regs; j++) {
+    uns16 id = uop->srcs[j].id;
+    if (id == REG_ZPS) {
+      reads_flags = TRUE;
+      continue;
     }
-    /* record this node as a chain step */
-    const Com2p_Imm* im = com2p_get_imm(node->inst);
-    steps[depth].iclass = node->inst->true_op_type;
-    steps[depth].imm = im->width ? im->imm : 0;
-    steps[depth].has_imm = im->width > 0;
-    depth++;
-    if (!have_next)
-      return COM2P_CHAIN_TO_CONST;
-    if (next.is_load) {
-      *load_pc = next.pc;
-      *len = (uns8)depth;
-      for (uns a = 0, b = depth - 1; a < b; a++, b--) {  // reverse to load-first order
-        Com2p_Chain_Step t = steps[a];
-        steps[a] = steps[b];
-        steps[b] = t;
+    if (id >= NUM_REGS)
+      continue;
+    Flag dup = FALSE;
+    for (uns s = 0; s < num_src; s++) {
+      if (src_id[s] == id) {
+        dup = TRUE;
+        break;
       }
-      return COM2P_CHAIN_OK;
     }
-    if (!next.op) {
-      STAT_EVENT(node->proc_id, COM2P_CHAIN_STALE_NODE);
-      return COM2P_CHAIN_STALE;  // retired mid-chain: identity known but src_info gone
+    if (dup) {
+      self_pair = TRUE;  // same register twice is still one dynamic input
+      continue;
     }
-    node = next.op;
+    if (num_src < 8) {
+      src_id[num_src] = id;
+      src_rec[num_src] = com2p_arf[id];
+      num_src++;
+    }
+  }
+
+  /* The record this op's register results carry forward. */
+  Com2p_Arf_Rec nr;
+  memset(&nr, 0, sizeof(nr));
+  if (uop->mem_type == MEM_LD) {
+    /* Chain root.  A load-op combo also roots here: the payload of interest is
+     * the uop's own register result (COM2P's value definition). */
+    nr.kind = COM2P_ARF_LOAD;
+    nr.load_pc = op->inst->addr;
+  } else if (uop->op_type == OP_IMUL || uop->op_type == OP_IDIV) {
+    nr.kind = COM2P_ARF_TAINT;
+    nr.taint = COM2P_CLS_COMP_COMPLEX_OP;
+  } else if (!com2p_op_class_compliant(uop->op_type) || reads_flags) {
+    /* Unsupported op class, or an extra dynamic input via flags (adc-style):
+     * non-compliant input, same bucket the walk era used. */
+    nr.kind = COM2P_ARF_TAINT;
+    nr.taint = COM2P_CLS_COMP_MULTIREG;
+  } else {
+    const Com2p_Arf_Rec* dyn = NULL;
+    uns num_dyn = 0;
+    for (uns s = 0; s < num_src; s++) {
+      if (src_rec[s].kind == COM2P_ARF_UNKNOWN)
+        continue;  // untracked register: treated as a constant-ish side
+      dyn = &src_rec[s];
+      num_dyn++;
+    }
+    if (num_dyn == 0) {
+      /* Pure immediate materialization roots a const; inputs that are all
+       * untracked stay unknown so cold state cannot masquerade as learnt. */
+      nr.kind = num_src ? COM2P_ARF_UNKNOWN : COM2P_ARF_CONST;
+    } else if (num_dyn >= 2) {
+      nr.kind = COM2P_ARF_TAINT;
+      nr.taint = COM2P_CLS_COMP_MULTIREG;
+    } else if (dyn->kind == COM2P_ARF_CONST) {
+      nr.kind = COM2P_ARF_CONST;
+    } else if (dyn->kind == COM2P_ARF_TAINT) {
+      nr = *dyn;  // a disqualification propagates with its original reason
+    } else if (dyn->len >= COM2P_CHAIN_MAX_OPS) {
+      nr.kind = COM2P_ARF_TAINT;
+      nr.taint = COM2P_CLS_COMP_TOO_DEEP;
+    } else {
+      nr = *dyn;
+      const Com2p_Imm* im = com2p_get_imm(op->inst);
+      nr.step[nr.len].iclass = op->inst->true_op_type;
+      nr.step[nr.len].imm = im->width ? im->imm : 0;
+      nr.step[nr.len].has_imm = im->width > 0;
+      nr.len++;
+    }
+  }
+
+  for (uns i = 0; i < num_dsts; i++) {
+    uns16 id = uop->dests[i].id;
+    if (id != REG_ZPS && id < NUM_REGS)
+      com2p_arf[id] = nr;
+  }
+  if (writes_flags) {
+    com2p_flags.valid = TRUE;
+    com2p_flags.num_slots = (uns8)MIN2(num_src, 2);
+    com2p_flags.overflow = num_src > 2;
+    com2p_flags.self_pair = self_pair;
+    com2p_flags.flag_src = reads_flags;
+    com2p_flags.folded_load = uop->mem_type == MEM_LD;
+    com2p_flags.writer_pc = op->inst->addr;
+    for (uns s = 0; s < com2p_flags.num_slots; s++)
+      com2p_flags.slot[s] = src_rec[s];
   }
 }
 
-static uns8 com2p_chain_fail_cls(Com2p_Chain_Res r) {
-  switch (r) {
-    case COM2P_CHAIN_MULTIREG:
-      return COM2P_CLS_COMP_MULTIREG;
-    case COM2P_CHAIN_COMPLEX_OP:
-      return COM2P_CLS_COMP_COMPLEX_OP;
-    case COM2P_CHAIN_TOO_DEEP:
-      return COM2P_CLS_COMP_TOO_DEEP;
-    case COM2P_CHAIN_TO_CONST:
-      return COM2P_CLS_NO_LOAD;
-    default:
-      return COM2P_CLS_UNRESOLVED;
-  }
-}
-
-/* The two-hop walk.  Fills *obs and returns its classification. */
-static uns8 com2p_classify(Op* op, Com2p_Obs* obs, Flag chain_sensitive) {
+/* Classification of a retiring flags-consuming CBR from the flags snapshot.
+ * Fills *obs and returns its classification. */
+static uns8 com2p_classify_arf(Op* op, Com2p_Obs* obs) {
   memset(obs, 0, sizeof(*obs));
   obs->cls = COM2P_CLS_UNRESOLVED;
 
-  /* Hop 1: the branch's register sources all resolve to the single op that
-   * computed its condition (the flags producer; the rcx producer for JCXZ). */
-  Flag stale = FALSE;
-  Op* cond = NULL;
-  uns num_reg_srcs = op->uop->num_src_regs;
-  ASSERT(op->proc_id, num_reg_srcs <= op->num_srcs);
-  for (uns k = 0; k < num_reg_srcs; k++) {
-    ASSERT(op->proc_id, op->src_info[k].type == REG_DATA_DEP);
-    Op* p = com2p_resolve(&op->src_info[k], &stale);
-    if (!p)
-      continue;
-    if (cond && p->op_num != cond->op_num) {
-      obs->cls = COM2P_CLS_MULTI_COND;
-      return obs->cls;
+  /* JCXZ-family branches consume a register, not flags; the per-register
+   * records collapse their writer's operand split, so classifying them would
+   * need a per-register slots view.  Measure the miss instead of paying it. */
+  for (uns k = 0; k < op->uop->num_src_regs; k++) {
+    if (op->uop->srcs[k].id != REG_ZPS) {
+      STAT_EVENT(op->proc_id, COM2P_ARF_NONFLAG_BR);
+      return COM2P_CLS_UNRESOLVED;
     }
-    cond = p;
   }
-  if (stale)
-    return COM2P_CLS_UNRESOLVED;
-  if (!cond) {
-    obs->cls = COM2P_CLS_NO_COND;
-    return obs->cls;
-  }
+  const Com2p_Flags_Rec* fr = &com2p_flags;
+  if (!fr->valid)
+    return COM2P_CLS_UNRESOLVED;  // cold state right after reset
 
-  /* A compare folded into a load-op appears as a flag-writing MEM_LD uop: the
-   * memory value reaches the comparison unmodified. */
-  if (com2p_op_is_load(cond)) {
+  /* A compare folded into a load-op is a flag-writing MEM_LD uop: the memory
+   * value reaches the comparison unmodified. */
+  if (fr->folded_load) {
     obs->cls = COM2P_CLS_CONST_DIR;
     obs->cmp_folded = 1;
     obs->num_loads = 1;
-    obs->load_pc[0] = cond->inst->addr;
+    obs->load_pc[0] = fr->writer_pc;
     return obs->cls;
   }
-
-  /* Hop 2: the cond's register value operands. */
-  Com2p_Prod slot[2];
-  uns num_slots = 0;
-  Flag deduped = FALSE;
-  uns cond_reg_srcs = cond->uop->num_src_regs;
-  ASSERT(cond->proc_id, cond_reg_srcs <= cond->num_srcs);
-  for (uns j = 0; j < cond_reg_srcs; j++) {
-    ASSERT(cond->proc_id, cond->src_info[j].type == REG_DATA_DEP);
-    if (cond->uop->srcs[j].id == REG_ZPS) {
-      obs->cls = COM2P_CLS_FLAG_CHAIN;
-      return obs->cls;
-    }
-    Com2p_Prod prod;
-    if (!com2p_resolve_slot(&cond->src_info[j], cond->uop->srcs[j].id, &prod))
-      return COM2P_CLS_UNRESOLVED;
-    if (prod.resolved) {
-      Flag dup = FALSE;
-      for (uns s = 0; s < num_slots; s++) {
-        if (slot[s].resolved && slot[s].op_num == prod.op_num) {
-          dup = TRUE;
-          deduped = TRUE;
-        }
-      }
-      if (dup)
-        continue;
-    }
-    if (num_slots >= 2) {
-      obs->cls = COM2P_CLS_COMPLEX;
-      return obs->cls;
-    }
-    slot[num_slots] = prod;
-    num_slots++;
+  if (fr->flag_src) {
+    obs->cls = COM2P_CLS_FLAG_CHAIN;
+    return obs->cls;
   }
-
-  if (deduped && num_slots == 1) {
+  if (fr->overflow) {
+    obs->cls = COM2P_CLS_COMPLEX;
+    return obs->cls;
+  }
+  if (fr->self_pair && fr->num_slots == 1) {
     obs->cls = COM2P_CLS_SELF;
     return obs->cls;
   }
+  uns num_slots = fr->num_slots;
   if (num_slots == 0) {
     obs->cls = COM2P_CLS_NO_COND;
     return obs->cls;
   }
 
   /* Per-slot outcome: a raw load, a load behind an immediate-only chain, or a
-   * disqualifier.  The chain walk runs unconditionally (classification depth);
-   * only CONFIRMED-eligibility of chain classes is gated by COM2P_COVER_COMP. */
+   * disqualifier -- all read directly off the propagated records. */
   uns num_load_slots = 0;
   uns num_chain_slots = 0;
   uns8 fail_cls = 0;
   for (uns s = 0; s < num_slots; s++) {
-    if (!slot[s].resolved)
-      continue;  // no-producer slot: constant-ish side
-    if (slot[s].is_load) {
-      if (num_load_slots < 2) {
-        obs->load_pc[num_load_slots] = slot[s].pc;
-        obs->chain_len[num_load_slots] = 0;
-      }
-      num_load_slots++;
-      continue;
-    }
-    if (!slot[s].op) {
-      /* Retired non-load producer: its identity is known but a chain walk is
-       * impossible.  If this entry's learnt structure involves chains, treat
-       * the instance as unresolved (a mix classification here would be a false
-       * mismatch); otherwise classify by identity exactly as the pre-chain
-       * code did, so chainless branches keep converging promptly. */
-      if (chain_sensitive) {
-        STAT_EVENT(op->proc_id, COM2P_CHAIN_STALE_NODE);
-        return COM2P_CLS_UNRESOLVED;
-      }
-      continue;  // counts as a resolved non-load side in the combine below
-    }
-    Addr lpc = 0;
-    uns8 clen = 0;
-    Com2p_Chain_Step csteps[4];
-    Com2p_Chain_Res r = com2p_chain_walk(slot[s].op, &lpc, &clen, csteps);
-    if (r == COM2P_CHAIN_OK) {
-      if (num_load_slots < 2) {
-        obs->load_pc[num_load_slots] = lpc;
-        obs->chain_len[num_load_slots] = clen;
-        memcpy(obs->chain[num_load_slots], csteps, sizeof(csteps));
-      }
-      num_load_slots++;
-      num_chain_slots++;
-      continue;
-    }
-    if (r == COM2P_CHAIN_STALE)
+    const Com2p_Arf_Rec* r = &fr->slot[s];
+    if (r->kind == COM2P_ARF_UNKNOWN) {
+      /* Cold source: not an observation (a first-obs freeze off cold state
+       * would poison the entry into an inconsistency reject). */
+      STAT_EVENT(op->proc_id, COM2P_ARF_UNKNOWN_SRC);
       return COM2P_CLS_UNRESOLVED;
-    if (!fail_cls)
-      fail_cls = com2p_chain_fail_cls(r);
+    }
+    if (r->kind == COM2P_ARF_CONST) {
+      /* Constant-materialized side: same label the walk era gave it. */
+      if (!fail_cls)
+        fail_cls = COM2P_CLS_NO_LOAD;
+      continue;
+    }
+    if (r->kind == COM2P_ARF_TAINT) {
+      if (!fail_cls)
+        fail_cls = r->taint;
+      continue;
+    }
+    if (num_load_slots < 2) {
+      obs->load_pc[num_load_slots] = r->load_pc;
+      obs->chain_len[num_load_slots] = r->len;
+      memcpy(obs->chain[num_load_slots], r->step, sizeof(obs->chain[0]));
+    }
+    num_load_slots++;
+    if (r->len > 0)
+      num_chain_slots++;
   }
 
   if (num_slots == 1) {
@@ -539,7 +469,7 @@ static uns8 com2p_classify(Op* op, Com2p_Obs* obs, Flag chain_sensitive) {
       uns8 tl = obs->chain_len[0];
       obs->chain_len[0] = obs->chain_len[1];
       obs->chain_len[1] = tl;
-      Com2p_Chain_Step ts[4];
+      Com2p_Chain_Step ts[COM2P_CHAIN_MAX_HARD];
       memcpy(ts, obs->chain[0], sizeof(ts));
       memcpy(obs->chain[0], obs->chain[1], sizeof(ts));
       memcpy(obs->chain[1], ts, sizeof(ts));
@@ -620,33 +550,24 @@ void com2p_on_retire(Op* op) {
     return;
   if (!com2p_cond_class_targetable(op->uop->cbr_cond_class))
     return;
-  /* profile_all: cross-validation mode -- classify every targetable CBR so the
-   * distribution is comparable to mispredict-weighted offline taxonomies. */
-  if (!COM2P_PROFILE_ALL && !is_h2p_at_exec(op->inst->addr))
-    return;
 
   com2p_table_init();
-  Flag new_entry = FALSE;
-  Com2p_Entry* e = (Com2p_Entry*)hash_table_access_create(&com2p_table, op->inst->addr, &new_entry);
-  if (!new_entry)
-    return;
-  memset(e, 0, sizeof(*e));
-  e->branch_pc = op->inst->addr;
-  e->state = COM2P_ST_PROFILING;
-  e->cond_class = op->uop->cbr_cond_class;
-  STAT_EVENT(op->proc_id, COM2P_ENTRY_ALLOC);
-}
-
-void com2p_on_map(Op* op) {
-  if (!COM2P_ENABLE || !com2p_table_inited)
-    return;
-  if (op->off_path)
-    return;
-  if (op->uop->cf_type != CF_CBR)
-    return;
   Com2p_Entry* e = com2p_lookup(op->inst->addr);
-  if (!e)
-    return;
+  if (!e) {
+    /* profile_all: cross-validation mode -- classify every targetable CBR so
+     * the distribution is comparable to mispredict-weighted offline
+     * taxonomies. */
+    if (!COM2P_PROFILE_ALL && !is_h2p_at_exec(op->inst->addr))
+      return;
+    Flag new_entry = FALSE;
+    e = (Com2p_Entry*)hash_table_access_create(&com2p_table, op->inst->addr, &new_entry);
+    ASSERT(op->proc_id, new_entry);
+    memset(e, 0, sizeof(*e));
+    e->branch_pc = op->inst->addr;
+    e->state = COM2P_ST_PROFILING;
+    e->cond_class = op->uop->cbr_cond_class;
+    STAT_EVENT(op->proc_id, COM2P_ENTRY_ALLOC);
+  }
   /* Normally a REJECTED tombstone ends observation.  In profile_all mode we
    * keep classifying every instance -- otherwise CONFIRMED (dir) entries
    * accumulate stats forever while rejected classes freeze at OBS_N per PC,
@@ -655,8 +576,7 @@ void com2p_on_map(Op* op) {
     return;
 
   Com2p_Obs obs;
-  Flag chain_sensitive = e->obs_count > 0 && (e->chain_len[0] || e->chain_len[1]);
-  uns8 cls = com2p_classify(op, &obs, chain_sensitive);
+  uns8 cls = com2p_classify_arf(op, &obs);
 
   /* Instance-level distribution, for cross-validation against the offline
    * exp29 taxonomy.  The stat blocks mirror Com2p_Cls order. */
@@ -706,9 +626,9 @@ void com2p_on_map(Op* op) {
     return;
   }
 
-  /* CONFIRMED: the same walk becomes the re-backtracking gate.  The override
-   * itself (value readiness + redirect) lives in the override stage; here we
-   * account for how often the learnt structure holds per instance. */
+  /* CONFIRMED: the same retire-time classification becomes the structure gate.
+   * The override itself (value readiness + redirect) lives in the override
+   * stage; here we account for how often the learnt structure holds. */
   if (cls == COM2P_CLS_UNRESOLVED) {
     e->unresolved++;
     return;
@@ -736,7 +656,8 @@ void com2p_on_map(Op* op) {
 /* Reset / dump */
 
 void com2p_reset(void) {
-  memset(com2p_retired_reg, 0, sizeof(com2p_retired_reg));
+  memset(com2p_arf, 0, sizeof(com2p_arf));  // COM2P_ARF_UNKNOWN == 0
+  memset(&com2p_flags, 0, sizeof(com2p_flags));
   if (com2p_chain_table_inited)
     hash_table_clear(&com2p_chain_table);
   if (!com2p_table_inited)
