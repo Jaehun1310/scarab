@@ -827,6 +827,21 @@ static uns generate_uops(uns8 proc_id, ctype_pin_inst* pi, Trace_Uop** trace_uop
 // and frees it after the split).
 static Inst_Info fake_inst_info_scratch[MAX_NUM_PROCS];
 
+/* Classifies a conditional branch's condition semantics from its decoded
+ * iclass mnemonic (see Cbr_Cond_Class in table_info.h). */
+static uns8 pin_iclass_cbr_cond_class(const char* iclass) {
+  if (!strcmp(iclass, "JZ") || !strcmp(iclass, "JNZ") || !strcmp(iclass, "JCXZ") || !strcmp(iclass, "JECXZ") ||
+      !strcmp(iclass, "JRCXZ"))
+    return CBR_COND_FIXED;
+  if (!strcmp(iclass, "JB") || !strcmp(iclass, "JNB") || !strcmp(iclass, "JBE") || !strcmp(iclass, "JNBE"))
+    return CBR_COND_BOUND_UNSIGNED;
+  if (!strcmp(iclass, "JL") || !strcmp(iclass, "JNL") || !strcmp(iclass, "JLE") || !strcmp(iclass, "JNLE"))
+    return CBR_COND_BOUND_SIGNED;
+  if (!strcmp(iclass, "JS") || !strcmp(iclass, "JNS"))
+    return CBR_COND_SIGN;
+  return CBR_COND_OTHER;
+}
+
 void convert_pinuop_to_t_uop(uns8 proc_id, ctype_pin_inst* pi, Trace_Uop** trace_uop) {
   Flag new_entry = FALSE;
   Inst_Info* info;
@@ -903,6 +918,10 @@ void convert_pinuop_to_t_uop(uns8 proc_id, ctype_pin_inst* pi, Trace_Uop** trace
         trace_uop[ii]->info->table_info.is_simd = pi->is_simd;
         trace_uop[ii]->info->uop_seq_num = ii;
         strcpy(trace_uop[ii]->info->table_info.name, pi->pin_iclass);
+        trace_uop[ii]->info->table_info.cbr_cond_class =
+            (trace_uop[ii]->info->table_info.cf_type == CF_CBR || trace_uop[ii]->info->table_info.cf_type == CF_REP)
+                ? pin_iclass_cbr_cond_class(pi->pin_iclass)
+                : CBR_COND_NONE;
         if (trace_uop[ii]->alu_uop) {
           trace_uop[ii]->info->table_info.num_simd_lanes = pi->num_simd_lanes;
           trace_uop[ii]->info->table_info.lane_width_bytes = pi->lane_width_bytes;

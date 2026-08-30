@@ -122,6 +122,19 @@ typedef enum Cf_Type_enum {
   NUM_CF_TYPES,
 } Cf_Type;
 
+/* Semantic class of a conditional branch's condition, derived from the jcc
+ * iclass at decode.  FIXED tests equality; the BOUND/SIGN classes test
+ * ordering.  Used by COM2P to classify H2P branches (FIX vs BND targets). */
+typedef enum Cbr_Cond_Class_enum {
+  CBR_COND_NONE,           // not a conditional-branch uop
+  CBR_COND_FIXED,          // JZ/JNZ (ZF) and J[RE]CXZ (RCX == 0): equality
+  CBR_COND_BOUND_UNSIGNED, // JB/JNB/JBE/JNBE: unsigned ordering (CF, CF|ZF)
+  CBR_COND_BOUND_SIGNED,   // JL/JNL/JLE/JNLE: signed ordering (SF^OF, ZF)
+  CBR_COND_SIGN,           // JS/JNS: sign bit alone, the ordering test vs 0
+  CBR_COND_OTHER,          // JO/JNO/JP/JNP, LOOP*, REP terminations
+  NUM_CBR_COND_CLASSES,
+} Cbr_Cond_Class;
+
 /* Bar_Type breaks denotes different kinds of barriers that can be recognized by the engine.
  * Use these as a mask to allow an instruction to have multiple barrier types. */
 typedef enum Bar_Type_enum {
@@ -144,6 +157,7 @@ struct Table_Info_struct {
   Mem_Type mem_type;   // type of memory instruction
   Cf_Type cf_type;     // type of control flow instruction
   Bar_Type bar_type;   // type of barrier caused by instruction
+  uns8 cbr_cond_class; // Cbr_Cond_Class of a conditional-branch uop; CBR_COND_NONE otherwise
   uns16 true_op_type;  // type of opcode from PIN. Should not be used for Scarab timing.
 
   uns num_dest_regs;  // number of destination registers written
