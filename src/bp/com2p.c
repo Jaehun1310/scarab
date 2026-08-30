@@ -310,7 +310,9 @@ void com2p_on_retire(Op* op) {
     return;
   if (!com2p_cond_class_targetable(op->uop->cbr_cond_class))
     return;
-  if (!is_h2p_at_exec(op->inst->addr))
+  /* profile_all: cross-validation mode -- classify every targetable CBR so the
+   * distribution is comparable to mispredict-weighted offline taxonomies. */
+  if (!COM2P_PROFILE_ALL && !is_h2p_at_exec(op->inst->addr))
     return;
 
   com2p_table_init();
