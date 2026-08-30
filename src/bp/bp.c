@@ -27,6 +27,7 @@
  ***************************************************************************************/
 
 #include "bp/bp.h"
+#include "bp/com2p.h"
 
 #include "globals/assert.h"
 #include "globals/global_defs.h"
@@ -970,6 +971,7 @@ void bp_retire_op(Bp_Data* bp_data, Op* op) {
 
   if (is_h2p_tracked_cf_type(op->uop->cf_type))
     branch_pc_stats_update(op);
+  com2p_on_retire(op);
 }
 
 /******************************************************************************/

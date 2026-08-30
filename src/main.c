@@ -215,6 +215,7 @@ Scarab's source code is organized as follows:
 #include "optimizer2.h"
 #include "param_parser.h"
 #include "sim.h"
+#include "bp/com2p.h"
 #include "statistics.h"
 #include "version.h"
 
@@ -283,6 +284,7 @@ int main(int argc, char* argv[], char* envp[]) {
   }
 
   /* all done --- print finish messages */
+  com2p_dump();
   time(&cur_time);
   fprintf(mystdout, "Scarab finished at %s\n", ctime(&cur_time));
   WRITE_STATUS("FINISHED");

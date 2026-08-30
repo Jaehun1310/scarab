@@ -26,6 +26,7 @@
  * Description  :
  ***************************************************************************************/
 
+#include "bp/com2p.h"
 #include "sim.h"
 
 #include <errno.h>
@@ -218,6 +219,7 @@ static inline void check_heartbeat(uns8 proc_id, Flag final) {
       warmup_dump_done[i] = TRUE;
     }
     reset_h2p_stats();
+    com2p_reset();
     period_last_cycle_count = cycle_count;
   }
 

@@ -1024,6 +1024,7 @@ static void populate_static_op_info(Static_Op_Info* so, const Inst_Info* info) {
   so->mem_type = info->table_info.mem_type;
   so->cf_type = info->table_info.cf_type;
   so->bar_type = info->table_info.bar_type;
+  so->cbr_cond_class = info->table_info.cbr_cond_class;
   so->num_src_regs = info->table_info.num_src_regs;
   so->num_dest_regs = info->table_info.num_dest_regs;
   for (uns i = 0; i < info->table_info.num_src_regs; i++) {

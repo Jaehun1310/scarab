@@ -197,4 +197,17 @@ DEF_PARAM(  h2p_track_ibr             , H2P_TRACK_IBR             , Flag    , Fl
 DEF_PARAM(  h2p_track_icall           , H2P_TRACK_ICALL           , Flag    , Flag       , FALSE      ,        )
 DEF_PARAM(  h2p_track_ret             , H2P_TRACK_RET             , Flag    , Flag       , FALSE      ,        )
 
+/* COM2P: override H2P conditional branches by computing the direction from feeder load values */
+DEF_PARAM(  com2p_enable              , COM2P_ENABLE              , Flag    , Flag       , FALSE      ,        )
+DEF_PARAM(  com2p_override            , COM2P_OVERRIDE            , Flag    , Flag       , FALSE      ,        )
+/* OFF: ideal supply (ready once the producer store's value is computed); ON: staged buffers */
+DEF_PARAM(  com2p_realistic_supply    , COM2P_REALISTIC_SUPPLY    , Flag    , Flag       , FALSE      ,        )
+/* OFF: dir targets only; ON: computed chains via the 3D-Overrider algorithm */
+DEF_PARAM(  com2p_cover_comp          , COM2P_COVER_COMP          , Flag    , Flag       , FALSE      ,        )
+/* OFF: re-backtracking match provides the oracle direction; ON: actually compute it */
+DEF_PARAM(  com2p_realistic_compute   , COM2P_REALISTIC_COMPUTE   , Flag    , Flag       , FALSE      ,        )
+DEF_PARAM(  com2p_obs_n               , COM2P_OBS_N               , uns     , uns        , 32         ,        )
+DEF_PARAM(  com2p_consist_pct         , COM2P_CONSIST_PCT         , uns     , uns        , 95         ,        )
+DEF_PARAM(  com2p_table_buckets       , COM2P_TABLE_BUCKETS       , uns     , uns        , 4096       ,        )
+
 DEF_PARAM( tagescl64kb_perfect_tag    , TAGESCL64KB_PERFECT_TAG   , Flag    , Flag       , FALSE      ,        )

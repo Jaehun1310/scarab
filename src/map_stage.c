@@ -30,6 +30,7 @@
 
 #include "map_stage.h"
 
+#include "bp/com2p.h"
 #include "globals/assert.h"
 #include "globals/debug_stage.h"
 #include "globals/global_defs.h"
@@ -258,6 +259,9 @@ static inline void stage_process_op(Op* op) {
   /* map the op based on true dependencies & set information in op->oracle_info */
   thread_map_op(op);
   thread_map_mem_dep(op);
+
+  /* COM2P: profile / gate H2P conditional branches now that src_info is set */
+  com2p_on_map(op);
 
   /* register renaming allocation */
   reg_file_rename(op);

@@ -47,6 +47,7 @@
 #include "memory/memory.param.h"
 
 #include "bp/bp.h"
+#include "bp/com2p.h"
 #include "bp/tagescl.h"
 #include "frontend/frontend.h"
 #include "memory/memory.h"
@@ -458,6 +459,7 @@ void node_retire() {
     rob_stall_reason = ROB_STALL_NONE;
 
     /**op is ready to retire**/
+    com2p_note_retire(op);
     ASSERTM(node->proc_id, op->state != OS_TENTATIVE, "op_num: %llu\n", op->op_num);
     ret_count++;
     DEBUG(node->proc_id, "Retiring op:%llu\n", op->op_num);

@@ -89,6 +89,7 @@ typedef struct Static_Op_Info_struct {
   Mem_Type mem_type;
   Cf_Type cf_type;
   Bar_Type bar_type;
+  uns8 cbr_cond_class;  // Cbr_Cond_Class of a conditional-branch uop; CBR_COND_NONE otherwise
 
   uns num_src_regs;
   uns num_dest_regs;
