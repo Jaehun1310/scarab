@@ -536,6 +536,12 @@ static Addr bp_predict_op_impl(Bp_Data* bp_data, Op* op, uns bp_id, uns br_num, 
         bp_pred_info->pred = pred_bp->pred_func(op, pred_level);
         bp_pred_info->pred_orig = bp_pred_info->pred;
       }
+      /* COM2P: substitute the computed direction for confirmed targets whose
+       * feeder values are ready.  pred_orig keeps the baseline direction; the
+       * resolution chain and history below then treat the override as the
+       * prediction, so an avoided flush simply never gets scheduled. */
+      if (COM2P_OVERRIDE)
+        com2p_override_predict(op, &bp_pred_info->pred);
       // Update history used by the rest of Scarab.
       if (pred_level == BP_PRED_MAIN)
         bp_data->global_hist = (bp_data->global_hist >> 1) | (bp_pred_info->pred << 31);

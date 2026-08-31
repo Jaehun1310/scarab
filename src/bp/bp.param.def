@@ -202,8 +202,11 @@ DEF_PARAM(  com2p_enable              , COM2P_ENABLE              , Flag    , Fl
 DEF_PARAM(  com2p_override            , COM2P_OVERRIDE            , Flag    , Flag       , FALSE      ,        )
 /* OFF: ideal supply (ready once the producer store's value is computed); ON: staged buffers */
 DEF_PARAM(  com2p_realistic_supply    , COM2P_REALISTIC_SUPPLY    , Flag    , Flag       , FALSE      ,        )
-/* OFF: dir targets only; ON: computed chains via the 3D-Overrider algorithm */
-DEF_PARAM(  com2p_cover_comp          , COM2P_COVER_COMP          , Flag    , Flag       , FALSE      ,        )
+/* coverage toggles: dir (raw compares) / comp (immediate-only chains) x 1-load (CONST) / 2-load (LVL) */
+DEF_PARAM(  com2p_cover_dir           , COM2P_COVER_DIR           , Flag    , Flag       , TRUE       ,        )
+DEF_PARAM(  com2p_cover_comp          , COM2P_COVER_COMP          , Flag    , Flag       , TRUE       ,        )
+DEF_PARAM(  com2p_cover_1load         , COM2P_COVER_1LOAD         , Flag    , Flag       , TRUE       ,        )
+DEF_PARAM(  com2p_cover_2load         , COM2P_COVER_2LOAD         , Flag    , Flag       , TRUE       ,        )
 /* OFF: re-backtracking match provides the oracle direction; ON: actually compute it */
 DEF_PARAM(  com2p_realistic_compute   , COM2P_REALISTIC_COMPUTE   , Flag    , Flag       , FALSE      ,        )
 DEF_PARAM(  com2p_obs_n               , COM2P_OBS_N               , uns     , uns        , 32         ,        )

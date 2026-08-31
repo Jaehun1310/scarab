@@ -49,6 +49,7 @@
 #include "bp/bp.param.h"
 #include "isa/isa.h"
 #include "libs/hash_lib.h"
+#include "lsq.h"
 #include "op.h"
 #include "statistics.h"
 
@@ -67,7 +68,6 @@ static void com2p_table_init(void) {
   if (com2p_table_inited)
     return;
   /* Modes that are not implemented yet must fail loudly, not be silently ignored. */
-  ASSERTM(0, !COM2P_OVERRIDE, "com2p_override is not implemented yet\n");
   ASSERTM(0, !COM2P_REALISTIC_SUPPLY, "com2p_realistic_supply is not implemented yet\n");
   ASSERTM(0, !COM2P_REALISTIC_COMPUTE, "com2p_realistic_compute is not implemented yet\n");
   ASSERTM(0, COM2P_CHAIN_MAX_OPS <= COM2P_CHAIN_MAX_HARD, "com2p_chain_max_ops > %u\n", COM2P_CHAIN_MAX_HARD);
@@ -199,6 +199,50 @@ static Com2p_Entry* com2p_lookup(Addr pc) {
   if (!com2p_table_inited)
     return NULL;
   return (Com2p_Entry*)hash_table_access(&com2p_table, pc);
+}
+
+/* ---- feeder instance tracking ---------------------------------------------------
+ * The ideal-supply analogue of the paper's FLT/LT: for every load PC named by a
+ * CONFIRMED entry, remember the youngest on-path instance seen in fetch order.
+ * A branch pairs with that instance at predict time (program-order-previous
+ * instance; loop-carried mismatches are absorbed by the structure gate). */
+typedef struct Com2p_Feeder_struct {
+  Counter op_num;
+  Addr va;
+  Flag valid;
+} Com2p_Feeder;
+
+static Hash_Table com2p_feeder_table;
+static Flag com2p_feeder_table_inited = FALSE;
+
+static void com2p_feeder_register(Addr load_pc) {
+  if (!com2p_feeder_table_inited) {
+    init_hash_table(&com2p_feeder_table, "com2p_feeder", COM2P_TABLE_BUCKETS, sizeof(Com2p_Feeder));
+    com2p_feeder_table_inited = TRUE;
+  }
+  Flag new_entry = FALSE;
+  Com2p_Feeder* f = (Com2p_Feeder*)hash_table_access_create(&com2p_feeder_table, load_pc, &new_entry);
+  if (new_entry)
+    memset(f, 0, sizeof(*f));
+}
+
+static Com2p_Feeder* com2p_feeder_lookup(Addr load_pc) {
+  if (!com2p_feeder_table_inited)
+    return NULL;
+  return (Com2p_Feeder*)hash_table_access(&com2p_feeder_table, load_pc);
+}
+
+void com2p_note_fetch(Op* op) {
+  if (!COM2P_ENABLE || !COM2P_OVERRIDE || !com2p_feeder_table_inited)
+    return;
+  if (op->uop->mem_type != MEM_LD || op->off_path || op->inst->fake_inst)
+    return;
+  Com2p_Feeder* f = com2p_feeder_lookup(op->inst->addr);
+  if (!f)
+    return;  // not a feeder of any CONFIRMED entry
+  f->op_num = op->op_num;
+  f->va = op->oracle_info.va;
+  f->valid = TRUE;
 }
 
 /**************************************************************************************/
@@ -483,11 +527,23 @@ static uns8 com2p_classify_arf(Op* op, Com2p_Obs* obs) {
   return obs->cls;
 }
 
-static Flag com2p_cls_is_target_dir(uns8 cls) {
-  return cls == COM2P_CLS_CONST_DIR || cls == COM2P_CLS_LVL_DIR;
-}
 static Flag com2p_cls_is_target_chain(uns8 cls) {
   return cls == COM2P_CLS_CONST_CHAIN || cls == COM2P_CLS_LVL_CHAIN;
+}
+/* Coverage is a 2x2 grid of independent toggles: dir/comp x 1-load/2-load. */
+static Flag com2p_cls_is_covered(uns8 cls) {
+  switch (cls) {
+    case COM2P_CLS_CONST_DIR:
+      return COM2P_COVER_DIR && COM2P_COVER_1LOAD;
+    case COM2P_CLS_LVL_DIR:
+      return COM2P_COVER_DIR && COM2P_COVER_2LOAD;
+    case COM2P_CLS_CONST_CHAIN:
+      return COM2P_COVER_COMP && COM2P_COVER_1LOAD;
+    case COM2P_CLS_LVL_CHAIN:
+      return COM2P_COVER_COMP && COM2P_COVER_2LOAD;
+    default:
+      return FALSE;
+  }
 }
 
 static Flag com2p_obs_matches_entry(const Com2p_Entry* e, const Com2p_Obs* obs) {
@@ -543,6 +599,41 @@ static inline Flag com2p_cond_class_targetable(uns8 cc) {
   return cc == CBR_COND_FIXED || cc == CBR_COND_BOUND_UNSIGNED || cc == CBR_COND_BOUND_SIGNED || cc == CBR_COND_SIGN;
 }
 
+/* Ideal-mode override at predict time: substitute the branch direction when the
+ * branch is a CONFIRMED covered target and every feeder value is ready.  The
+ * decision is evaluated once per dynamic instance and cached on the op so both
+ * prediction levels (L0/MAIN) act coherently; ideal compute supplies the oracle
+ * direction (COM2P_PROVIDED_RISK bounds what a real computation would miss). */
+void com2p_override_predict(Op* op, uns8* pred) {
+  if (!COM2P_OVERRIDE || !com2p_table_inited)
+    return;
+  if (op->off_path || op->inst->fake_inst)
+    return;
+  if (op->com2p_prov == 0) {
+    op->com2p_prov = 2;
+    Com2p_Entry* e = com2p_lookup(op->inst->addr);
+    if (!e || e->state != COM2P_ST_CONFIRMED)
+      return;
+    if (!com2p_cls_is_covered(e->cls))
+      return;
+    for (uns i = 0; i < e->num_loads; i++) {
+      Com2p_Feeder* f = com2p_feeder_lookup(e->load_pc[i]);
+      if (!f || !f->valid) {
+        STAT_EVENT(op->proc_id, COM2P_NO_INSTANCE);
+        return;
+      }
+      if (lsq_com2p_store_pending(f->va, f->op_num)) {
+        STAT_EVENT(op->proc_id, COM2P_NOT_READY);
+        return;
+      }
+    }
+    op->com2p_prov = 1;
+    STAT_EVENT(op->proc_id, COM2P_PROVIDED);
+  }
+  if (op->com2p_prov == 1)
+    *pred = op->oracle_info.dir;
+}
+
 void com2p_on_retire(Op* op) {
   if (!COM2P_ENABLE)
     return;
@@ -584,6 +675,22 @@ void com2p_on_retire(Op* op) {
   if (op->bp_pred_main.recovery_point == RECOVER_AT_EXEC)
     STAT_EVENT(op->proc_id, COM2P_OBSMIS_UNRESOLVED + cls);
 
+  /* Override accounting: engaged instances are judged here, where both the
+   * baseline direction (pred_orig) and the realized structure are known. */
+  if (op->com2p_prov == 1) {
+    e->provided++;
+    if (op->bp_pred_main.pred_orig != op->oracle_info.dir) {
+      if (op->bp_pred_main.recovery_point == RECOVER_AT_NONE) {
+        e->success++;  // the baseline would have mispredicted; the flush vanished
+        STAT_EVENT(op->proc_id, COM2P_PROVIDED_SAVE);
+      } else {
+        STAT_EVENT(op->proc_id, COM2P_PROVIDED_BLOCKED);  // BTB miss kept its flush
+      }
+    }
+    if (cls != COM2P_CLS_UNRESOLVED && !com2p_obs_matches_entry(e, &obs))
+      STAT_EVENT(op->proc_id, COM2P_PROVIDED_RISK);  // ideal compute idealized this one
+  }
+
   if (e->state == COM2P_ST_REJECTED)
     return;  // profile_all: distribution only, the tombstone stays final
 
@@ -611,10 +718,12 @@ void com2p_on_retire(Op* op) {
       e->obs_match++;
     if (e->obs_count >= COM2P_OBS_N) {
       Flag consistent = (uns)e->obs_match * 100 >= (uns)e->obs_count * COM2P_CONSIST_PCT;
-      Flag target = com2p_cls_is_target_dir(e->cls) || (COM2P_COVER_COMP && com2p_cls_is_target_chain(e->cls));
+      Flag target = com2p_cls_is_covered(e->cls);
       if (consistent && target) {
         e->state = COM2P_ST_CONFIRMED;
         STAT_EVENT(op->proc_id, COM2P_ENTRY_CONFIRMED);
+        for (uns i = 0; i < e->num_loads; i++)
+          com2p_feeder_register(e->load_pc[i]);
       } else {
         e->state = COM2P_ST_REJECTED;
         e->reject_reason = consistent ? e->cls : COM2P_REJ_INCONSISTENT;
@@ -658,6 +767,8 @@ void com2p_on_retire(Op* op) {
 void com2p_reset(void) {
   memset(com2p_arf, 0, sizeof(com2p_arf));  // COM2P_ARF_UNKNOWN == 0
   memset(&com2p_flags, 0, sizeof(com2p_flags));
+  if (com2p_feeder_table_inited)
+    hash_table_clear(&com2p_feeder_table);
   if (com2p_chain_table_inited)
     hash_table_clear(&com2p_chain_table);
   if (!com2p_table_inited)
@@ -671,6 +782,7 @@ typedef struct Com2p_Dump_Agg_struct {
   Counter rejected_by_reason[COM2P_NUM_CLS + 2];
   Counter confirmed_by_cls[COM2P_NUM_CLS];
   Counter gate_match, gate_mismatch, unresolved;
+  Counter provided, success;
 } Com2p_Dump_Agg;
 
 static void com2p_dump_scan(void* data, void* arg) {
@@ -685,10 +797,13 @@ static void com2p_dump_scan(void* data, void* arg) {
     agg->confirmed_by_cls[e->cls]++;
     agg->gate_match += e->gate_match;
     agg->gate_mismatch += e->gate_mismatch;
-    printf("COM2P CONFIRMED pc=0x%llx cls=%u folded=%u loads=%u load_pc=0x%llx/0x%llx gate=%llu/%llu",
+    agg->provided += e->provided;
+    agg->success += e->success;
+    printf("COM2P CONFIRMED pc=0x%llx cls=%u folded=%u loads=%u load_pc=0x%llx/0x%llx gate=%llu/%llu prov=%llu save=%llu",
            (unsigned long long)e->branch_pc, e->cls, e->cmp_folded, e->num_loads, (unsigned long long)e->load_pc[0],
            (unsigned long long)e->load_pc[1], (unsigned long long)e->gate_match,
-           (unsigned long long)(e->gate_match + e->gate_mismatch));
+           (unsigned long long)(e->gate_match + e->gate_mismatch), (unsigned long long)e->provided,
+           (unsigned long long)e->success);
     for (uns i = 0; i < e->num_loads; i++) {
       if (!e->chain_len[i])
         continue;
@@ -719,6 +834,8 @@ void com2p_dump(void) {
          (unsigned long long)agg.confirmed_by_cls[COM2P_CLS_LVL_CHAIN]);
   printf("COM2P GATE match=%llu mismatch=%llu\n", (unsigned long long)agg.gate_match,
          (unsigned long long)agg.gate_mismatch);
+  printf("COM2P OVERRIDE provided=%llu saved=%llu\n", (unsigned long long)agg.provided,
+         (unsigned long long)agg.success);
   printf("COM2P REJECTED_BY_REASON");
   for (uns r = 0; r <= COM2P_NUM_CLS + 1; r++)
     printf(" %u:%llu", r, (unsigned long long)agg.rejected_by_reason[r]);

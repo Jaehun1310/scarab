@@ -197,6 +197,7 @@ struct Op_struct {
   // {{{ path and fetch info
   Flag off_path;                // is the op on the correct path of the program? - oracle information
   Flag conf_off_path;           // is the op on the correct path of the program? - confidence information
+  uns8 com2p_prov;              // COM2P override decision: 0 unevaluated, 1 provided, 2 denied
   Flag exit;                    // is this the last instruction to execute?
   Recovery_Info recovery_info;  // information that will be used to recover a mispredict by the op
   // }}}

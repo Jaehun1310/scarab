@@ -259,6 +259,26 @@ void set_lsq(uns8 proc_id) {
   lsq_unit = &per_core_lsq_unit[proc_id];
 }
 
+Flag lsq_com2p_store_pending(Addr va, Counter load_op_num) {
+  if (!LSQ_ENABLE || !lsq_unit)
+    return FALSE;  // no store visibility modelled: ideally ready
+  const LSQ* sq = lsq_unit->get_queue(MEM_ST);
+  for (const auto& en : sq->get_entries()) {
+    if (en.off_path)
+      continue;
+    if (en.op_num >= load_op_num)
+      continue;  // younger than the paired load: not its producer
+    Op* sop = en.op;
+    if (!sop || sop->op_num != en.op_num)
+      continue;
+    if ((sop->oracle_info.va & ~(Addr)7) != (va & ~(Addr)7))
+      continue;  // 8B-granule overlap only
+    if (!OP_DONE(sop))
+      return TRUE;  // the producer store's data is not computed yet
+  }
+  return FALSE;
+}
+
 void init_lsq(uns8 proc_id, const char* name) {
   if (!LSQ_ENABLE)
     return;

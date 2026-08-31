@@ -27,6 +27,8 @@
 
 #include "ft.h"
 
+#include "bp/com2p.h"
+
 #include <cstdio>
 #include <functional>
 #include <iostream>
@@ -286,6 +288,11 @@ std::pair<FT*, FT*> FT::extract_off_path_ft(uns split_index) {
 }
 
 FT_Event FT::predict_op_ft_event(Op* op, Bp_Pred_Level pred_level) {
+  /* COM2P feeder tracking sees every op exactly once, in fetch order (the MAIN
+   * call always runs; L0 is optional), so a branch's predict-time pairing finds
+   * the program-order-previous instance of its feeder load. */
+  if (pred_level == BP_PRED_MAIN)
+    com2p_note_fetch(op);
   Bp_Pred_Info* bp_pred_info = (pred_level == BP_PRED_L0) ? &op->bp_pred_l0 : &op->bp_pred_main;
   bool trace_mode = false;
 

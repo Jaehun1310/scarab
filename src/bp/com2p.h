@@ -32,6 +32,10 @@
 
 #include "globals/global_types.h"
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 struct Op_struct;
 
 /* Per-instance classification of a walked branch.  Order must match the
@@ -92,7 +96,13 @@ typedef struct Com2p_Entry_struct {
 
 void com2p_on_retire(struct Op_struct* op);   // H2P alloc + classification (profiling / gate)
 void com2p_note_retire(struct Op_struct* op);  // every retired op: ARF-ext forward propagation
+void com2p_note_fetch(struct Op_struct* op);   // every fetched op: track feeder load instances
+void com2p_override_predict(struct Op_struct* op, uns8* pred);  // ideal-mode direction substitution
 void com2p_reset(void);                        // warmup boundary: drop all state
 void com2p_dump(void);                         // end-of-sim summary
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* #ifndef __COM2P_H__ */

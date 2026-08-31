@@ -50,6 +50,10 @@ void lsq_commit(Op* mem_op);            // free the entry when the mem op is ret
 
 int lsq_get_in_flight_load_num();
 
+/* COM2P ideal-supply probe: TRUE if an on-path in-flight store older than
+ * load_op_num touches va's 8B granule and has not computed its data yet. */
+Flag lsq_com2p_store_pending(Addr va, Counter load_op_num);
+
 #ifdef __cplusplus
 }
 #endif
